@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>about</title>
+  <style>
+:root{
+  --dark-color:#635bff;
+  --light-color:#80e9ff;
+}
+#triangle_1, #triangle_2{
+  fill:var(--dark-color);
+}
+#triangle_3{
+  fill:var(--light-color);
+  transform: translatex(-100%);
+}
+#triangle_1, #triangle_2, #triangle_3
+{
+  transition: all 1s ease;
+}
+svg:hover #triangle_1 {
+  transform: translatex(20%);
+}
+svg:hover #triangle_2 {
+  transform: translatex(40%);
+  opacity:0;
+}
+svg:hover #triangle_3 {
+  transform: translatex(0%);
+}
+  </style>
+</head>
+<body>
+<svg width="100" height="100" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="Frame 1">
+<path id="triangle_1" d="M37.1968 50.3664L9.27616 67.4105L9.62013 32.7712L37.1968 50.3664Z"/>
+<path id="triangle_2" d="M55.1968 50.3664L27.2762 67.4105L27.6201 32.7712L55.1968 50.3664Z" fill-opacity="0.96"/>
+<path id="triangle_3" d="M87.1968 50.3664L59.2761 67.4105L59.6201 32.7712L87.1968 50.3664Z"/>
+</g>
+</svg>
+<script>
+const svg = document.getElementById("triangle_1");
+svg.onclick = (e) => {
+	const colors = ['red', 'blue', 'green', 'orange', 'pink', 'purple'];
+  const rando = () => {
+  	return colors[Math.floor(Math.random() * colors.length)];
+  };
+  document.documentElement.style.cssText = `
+    --dark-color: ${rando()};
+    --light-color: ${rando()};
+  `;
+};
+</script>
+</body>
+</html>
