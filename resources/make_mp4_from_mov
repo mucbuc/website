@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+ffmpeg -i morph.mov -vcodec h264 -acodec aac morph.mp4
