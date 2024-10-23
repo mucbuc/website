@@ -4,7 +4,6 @@ class TestComponent extends HTMLElement
 	{
 		this.textContent = "hello";
 	}
-
 }
 
 customElements.define('x-test', TestComponent);
