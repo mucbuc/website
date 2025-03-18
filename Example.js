@@ -597,6 +597,20 @@ function createExportWrapper(name, nargs) {
 }
 
 // include: runtime_exceptions.js
+// Base Emscripten EH error class
+class EmscriptenEH extends Error {}
+
+class EmscriptenSjLj extends EmscriptenEH {}
+
+class CppException extends EmscriptenEH {
+  constructor(excPtr) {
+    super(excPtr);
+    this.excPtr = excPtr;
+    const excInfo = getExceptionMessage(excPtr);
+    this.name = excInfo[0];
+    this.message = excInfo[1];
+  }
+}
 // end include: runtime_exceptions.js
 function findWasmBinary() {
     var f = 'Example.wasm';
@@ -880,6 +894,12 @@ function dbg(...args) {
 }
 // end include: runtime_debug.js
 // === Body ===
+
+var ASM_CONSTS = {
+  116320: ($0) => { InitNative($0) },  
+ 116335: ($0) => { FetchBounds($0) }
+};
+
 // end include: preamble.js
 
 
@@ -1038,6 +1058,39 @@ function dbg(...args) {
       abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [filename ? UTF8ToString(filename) : 'unknown filename', line, func ? UTF8ToString(func) : 'unknown function']);
     };
 
+  var exceptionCaught =  [];
+  
+  
+  
+  var uncaughtExceptionCount = 0;
+  var ___cxa_begin_catch = (ptr) => {
+      var info = new ExceptionInfo(ptr);
+      if (!info.get_caught()) {
+        info.set_caught(true);
+        uncaughtExceptionCount--;
+      }
+      info.set_rethrown(false);
+      exceptionCaught.push(info);
+      ___cxa_increment_exception_refcount(ptr);
+      return ___cxa_get_exception_ptr(ptr);
+    };
+
+  
+  var exceptionLast = 0;
+  
+  
+  var ___cxa_end_catch = () => {
+      // Clear state flag.
+      _setThrew(0, 0);
+      assert(exceptionCaught.length > 0);
+      // Call destructor if one is registered then clear it.
+      var info = exceptionCaught.pop();
+  
+      ___cxa_decrement_exception_refcount(info.excPtr);
+      exceptionLast = 0; // XXX in decRef?
+    };
+
+  
   class ExceptionInfo {
       // excPtr - Thrown object pointer to wrap. Metadata pointer is calculated from it.
       constructor(excPtr) {
@@ -1095,17 +1148,87 @@ function dbg(...args) {
       }
     }
   
-  var exceptionLast = 0;
+  var ___resumeException = (ptr) => {
+      if (!exceptionLast) {
+        exceptionLast = new CppException(ptr);
+      }
+      throw exceptionLast;
+    };
   
-  var uncaughtExceptionCount = 0;
+  
+  var setTempRet0 = (val) => __emscripten_tempret_set(val);
+  var findMatchingCatch = (args) => {
+      var thrown =
+        exceptionLast?.excPtr;
+      if (!thrown) {
+        // just pass through the null ptr
+        setTempRet0(0);
+        return 0;
+      }
+      var info = new ExceptionInfo(thrown);
+      info.set_adjusted_ptr(thrown);
+      var thrownType = info.get_type();
+      if (!thrownType) {
+        // just pass through the thrown ptr
+        setTempRet0(0);
+        return thrown;
+      }
+  
+      // can_catch receives a **, add indirection
+      // The different catch blocks are denoted by different types.
+      // Due to inheritance, those types may not precisely match the
+      // type of the thrown object. Find one which matches, and
+      // return the type of the catch block which should be called.
+      for (var caughtType of args) {
+        if (caughtType === 0 || caughtType === thrownType) {
+          // Catch all clause matched or exactly the same type is caught
+          break;
+        }
+        var adjusted_ptr_addr = info.ptr + 16;
+        if (___cxa_can_catch(caughtType, thrownType, adjusted_ptr_addr)) {
+          setTempRet0(caughtType);
+          return thrown;
+        }
+      }
+      setTempRet0(thrownType);
+      return thrown;
+    };
+  var ___cxa_find_matching_catch_2 = () => findMatchingCatch([]);
+
+  var ___cxa_find_matching_catch_3 = (arg0) => findMatchingCatch([arg0]);
+
+  
+  
+  var ___cxa_rethrow = () => {
+      var info = exceptionCaught.pop();
+      if (!info) {
+        abort('no exception to throw');
+      }
+      var ptr = info.excPtr;
+      if (!info.get_rethrown()) {
+        // Only pop if the corresponding push was through rethrow_primary_exception
+        exceptionCaught.push(info);
+        info.set_rethrown(true);
+        info.set_caught(false);
+        uncaughtExceptionCount++;
+      }
+      exceptionLast = new CppException(ptr);
+      throw exceptionLast;
+    };
+
+  
+  
   var ___cxa_throw = (ptr, type, destructor) => {
       var info = new ExceptionInfo(ptr);
       // Initialize ExceptionInfo content after it was allocated in __cxa_allocate_exception.
       info.init(type, destructor);
-      exceptionLast = ptr;
+      exceptionLast = new CppException(ptr);
       uncaughtExceptionCount++;
-      assert(false, 'Exception thrown, but exception catching is not enabled. Compile with -sNO_DISABLE_EXCEPTION_CATCHING or -sEXCEPTION_CATCHING_ALLOWED=[..] to catch.');
+      throw exceptionLast;
     };
+
+  var ___cxa_uncaught_exceptions = () => uncaughtExceptionCount;
+
 
   /** @suppress {duplicate } */
   var syscallGetVarargI = () => {
@@ -3994,95 +4117,45 @@ function dbg(...args) {
       }
     };
 
-  var _emscripten_date_now = () => Date.now();
+  var readEmAsmArgsArray = [];
+  var readEmAsmArgs = (sigPtr, buf) => {
+      // Nobody should have mutated _readEmAsmArgsArray underneath us to be something else than an array.
+      assert(Array.isArray(readEmAsmArgsArray));
+      // The input buffer is allocated on the stack, so it must be stack-aligned.
+      assert(buf % 16 == 0);
+      readEmAsmArgsArray.length = 0;
+      var ch;
+      // Most arguments are i32s, so shift the buffer pointer so it is a plain
+      // index into HEAP32.
+      while (ch = HEAPU8[sigPtr++]) {
+        var chr = String.fromCharCode(ch);
+        var validChars = ['d', 'f', 'i', 'p'];
+        assert(validChars.includes(chr), `Invalid character ${ch}("${chr}") in readEmAsmArgs! Use only [${validChars}], and do not specify "v" for void return argument.`);
+        // Floats are always passed as doubles, so all types except for 'i'
+        // are 8 bytes and require alignment.
+        var wide = (ch != 105);
+        wide &= (ch != 112);
+        buf += wide && (buf % 8) ? 4 : 0;
+        readEmAsmArgsArray.push(
+          // Special case for pointers under wasm64 or CAN_ADDRESS_2GB mode.
+          ch == 112 ? HEAPU32[((buf)>>2)] :
+          ch == 105 ?
+            HEAP32[((buf)>>2)] :
+            HEAPF64[((buf)>>3)]
+        );
+        buf += wide ? 8 : 4;
+      }
+      return readEmAsmArgsArray;
+    };
+  var runEmAsmFunction = (code, sigPtr, argbuf) => {
+      var args = readEmAsmArgs(sigPtr, argbuf);
+      assert(ASM_CONSTS.hasOwnProperty(code), `No EM_ASM constant found at address ${code}.  The loaded WebAssembly file is likely out of sync with the generated JavaScript.`);
+      return ASM_CONSTS[code](...args);
+    };
+  var _emscripten_asm_const_int = (code, sigPtr, argbuf) => {
+      return runEmAsmFunction(code, sigPtr, argbuf);
+    };
 
-  var _emscripten_get_now = () => performance.now();
-
-  var getHeapMax = () =>
-      HEAPU8.length;
-  
-  
-  var abortOnCannotGrowMemory = (requestedSize) => {
-      abort(`Cannot enlarge memory arrays to size ${requestedSize} bytes (OOM). Either (1) compile with -sINITIAL_MEMORY=X with X higher than the current value ${HEAP8.length}, (2) compile with -sALLOW_MEMORY_GROWTH which allows increasing the size at runtime, or (3) if you want malloc to return NULL (0) instead of this abort, compile with -sABORTING_MALLOC=0`);
-    };
-  var _emscripten_resize_heap = (requestedSize) => {
-      var oldSize = HEAPU8.length;
-      // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
-      requestedSize >>>= 0;
-      abortOnCannotGrowMemory(requestedSize);
-    };
-
-  
-  var handleException = (e) => {
-      // Certain exception types we do not treat as errors since they are used for
-      // internal control flow.
-      // 1. ExitStatus, which is thrown by exit()
-      // 2. "unwind", which is thrown by emscripten_unwind_to_js_event_loop() and others
-      //    that wish to return to JS event loop.
-      if (e instanceof ExitStatus || e == 'unwind') {
-        return EXITSTATUS;
-      }
-      checkStackCookie();
-      if (e instanceof WebAssembly.RuntimeError) {
-        if (_emscripten_stack_get_current() <= 0) {
-          err('Stack overflow detected.  You can try increasing -sSTACK_SIZE (currently set to 65536)');
-        }
-      }
-      quit_(1, e);
-    };
-  
-  
-  var runtimeKeepaliveCounter = 0;
-  var keepRuntimeAlive = () => noExitRuntime || runtimeKeepaliveCounter > 0;
-  var _proc_exit = (code) => {
-      EXITSTATUS = code;
-      if (!keepRuntimeAlive()) {
-        Module['onExit']?.(code);
-        ABORT = true;
-      }
-      quit_(code, new ExitStatus(code));
-    };
-  
-  
-  /** @suppress {duplicate } */
-  /** @param {boolean|number=} implicit */
-  var exitJS = (status, implicit) => {
-      EXITSTATUS = status;
-  
-      checkUnflushedContent();
-  
-      // if exit() was called explicitly, warn the user if the runtime isn't actually being shut down
-      if (keepRuntimeAlive() && !implicit) {
-        var msg = `program exited (with status: ${status}), but keepRuntimeAlive() is set (counter=${runtimeKeepaliveCounter}) due to an async operation, so halting execution but not exiting the runtime or preventing further async execution (you can use emscripten_force_exit, if you want to force a true shutdown)`;
-        err(msg);
-      }
-  
-      _proc_exit(status);
-    };
-  var _exit = exitJS;
-  
-  
-  var maybeExit = () => {
-      if (!keepRuntimeAlive()) {
-        try {
-          _exit(EXITSTATUS);
-        } catch (e) {
-          handleException(e);
-        }
-      }
-    };
-  var callUserCallback = (func) => {
-      if (ABORT) {
-        err('user callback triggered after runtime exited or application aborted.  Ignoring.');
-        return;
-      }
-      try {
-        func();
-        maybeExit();
-      } catch (e) {
-        handleException(e);
-      }
-    };
   
   var _emscripten_set_main_loop_timing = (mode, value) => {
       MainLoop.timingMode = mode;
@@ -4143,94 +4216,66 @@ function dbg(...args) {
       }
       return 0;
     };
-  var MainLoop = {
-  running:false,
-  scheduler:null,
-  method:"",
-  currentlyRunningMainloop:0,
-  func:null,
-  arg:0,
-  timingMode:0,
-  timingValue:0,
-  currentFrameNumber:0,
-  queue:[],
-  preMainLoop:[],
-  postMainLoop:[],
-  pause() {
-        MainLoop.scheduler = null;
-        // Incrementing this signals the previous main loop that it's now become old, and it must return.
-        MainLoop.currentlyRunningMainloop++;
-      },
-  resume() {
-        MainLoop.currentlyRunningMainloop++;
-        var timingMode = MainLoop.timingMode;
-        var timingValue = MainLoop.timingValue;
-        var func = MainLoop.func;
-        MainLoop.func = null;
-        // do not set timing and call scheduler, we will do it on the next lines
-        setMainLoop(func, 0, false, MainLoop.arg, true);
-        _emscripten_set_main_loop_timing(timingMode, timingValue);
-        MainLoop.scheduler();
-      },
-  updateStatus() {
-        if (Module['setStatus']) {
-          var message = Module['statusMessage'] || 'Please wait...';
-          var remaining = MainLoop.remainingBlockers ?? 0;
-          var expected = MainLoop.expectedBlockers ?? 0;
-          if (remaining) {
-            if (remaining < expected) {
-              Module['setStatus'](`{message} ({expected - remaining}/{expected})`);
-            } else {
-              Module['setStatus'](message);
-            }
-          } else {
-            Module['setStatus']('');
-          }
-        }
-      },
-  init() {
-        Module['preMainLoop'] && MainLoop.preMainLoop.push(Module['preMainLoop']);
-        Module['postMainLoop'] && MainLoop.postMainLoop.push(Module['postMainLoop']);
-      },
-  runIter(func) {
-        if (ABORT) return;
-        for (var pre of MainLoop.preMainLoop) {
-          if (pre() === false) {
-            return; // |return false| skips a frame
-          }
-        }
-        callUserCallback(func);
-        for (var post of MainLoop.postMainLoop) {
-          post();
-        }
-        checkStackCookie();
-      },
-  nextRAF:0,
-  fakeRequestAnimationFrame(func) {
-        // try to keep 60fps between calls to here
-        var now = Date.now();
-        if (MainLoop.nextRAF === 0) {
-          MainLoop.nextRAF = now + 1000/60;
-        } else {
-          while (now + 2 >= MainLoop.nextRAF) { // fudge a little, to avoid timer jitter causing us to do lots of delay:0
-            MainLoop.nextRAF += 1000/60;
-          }
-        }
-        var delay = Math.max(MainLoop.nextRAF - now, 0);
-        setTimeout(func, delay);
-      },
-  requestAnimationFrame(func) {
-        if (typeof requestAnimationFrame == 'function') {
-          requestAnimationFrame(func);
-          return;
-        }
-        var RAF = MainLoop.fakeRequestAnimationFrame;
-        RAF(func);
-      },
-  };
+  
+  var _emscripten_get_now = () => performance.now();
   
   
+  var runtimeKeepaliveCounter = 0;
+  var keepRuntimeAlive = () => noExitRuntime || runtimeKeepaliveCounter > 0;
+  var _proc_exit = (code) => {
+      EXITSTATUS = code;
+      if (!keepRuntimeAlive()) {
+        Module['onExit']?.(code);
+        ABORT = true;
+      }
+      quit_(code, new ExitStatus(code));
+    };
   
+  
+  /** @suppress {duplicate } */
+  /** @param {boolean|number=} implicit */
+  var exitJS = (status, implicit) => {
+      EXITSTATUS = status;
+  
+      checkUnflushedContent();
+  
+      // if exit() was called explicitly, warn the user if the runtime isn't actually being shut down
+      if (keepRuntimeAlive() && !implicit) {
+        var msg = `program exited (with status: ${status}), but keepRuntimeAlive() is set (counter=${runtimeKeepaliveCounter}) due to an async operation, so halting execution but not exiting the runtime or preventing further async execution (you can use emscripten_force_exit, if you want to force a true shutdown)`;
+        err(msg);
+      }
+  
+      _proc_exit(status);
+    };
+  var _exit = exitJS;
+  
+  var handleException = (e) => {
+      // Certain exception types we do not treat as errors since they are used for
+      // internal control flow.
+      // 1. ExitStatus, which is thrown by exit()
+      // 2. "unwind", which is thrown by emscripten_unwind_to_js_event_loop() and others
+      //    that wish to return to JS event loop.
+      if (e instanceof ExitStatus || e == 'unwind') {
+        return EXITSTATUS;
+      }
+      checkStackCookie();
+      if (e instanceof WebAssembly.RuntimeError) {
+        if (_emscripten_stack_get_current() <= 0) {
+          err('Stack overflow detected.  You can try increasing -sSTACK_SIZE (currently set to 65536)');
+        }
+      }
+      quit_(1, e);
+    };
+  
+  var maybeExit = () => {
+      if (!keepRuntimeAlive()) {
+        try {
+          _exit(EXITSTATUS);
+        } catch (e) {
+          handleException(e);
+        }
+      }
+    };
   
     /**
      * @param {number=} arg
@@ -4325,6 +4370,128 @@ function dbg(...args) {
       }
     };
   
+  
+  var callUserCallback = (func) => {
+      if (ABORT) {
+        err('user callback triggered after runtime exited or application aborted.  Ignoring.');
+        return;
+      }
+      try {
+        func();
+        maybeExit();
+      } catch (e) {
+        handleException(e);
+      }
+    };
+  
+  var MainLoop = {
+  running:false,
+  scheduler:null,
+  method:"",
+  currentlyRunningMainloop:0,
+  func:null,
+  arg:0,
+  timingMode:0,
+  timingValue:0,
+  currentFrameNumber:0,
+  queue:[],
+  preMainLoop:[],
+  postMainLoop:[],
+  pause() {
+        MainLoop.scheduler = null;
+        // Incrementing this signals the previous main loop that it's now become old, and it must return.
+        MainLoop.currentlyRunningMainloop++;
+      },
+  resume() {
+        MainLoop.currentlyRunningMainloop++;
+        var timingMode = MainLoop.timingMode;
+        var timingValue = MainLoop.timingValue;
+        var func = MainLoop.func;
+        MainLoop.func = null;
+        // do not set timing and call scheduler, we will do it on the next lines
+        setMainLoop(func, 0, false, MainLoop.arg, true);
+        _emscripten_set_main_loop_timing(timingMode, timingValue);
+        MainLoop.scheduler();
+      },
+  updateStatus() {
+        if (Module['setStatus']) {
+          var message = Module['statusMessage'] || 'Please wait...';
+          var remaining = MainLoop.remainingBlockers ?? 0;
+          var expected = MainLoop.expectedBlockers ?? 0;
+          if (remaining) {
+            if (remaining < expected) {
+              Module['setStatus'](`{message} ({expected - remaining}/{expected})`);
+            } else {
+              Module['setStatus'](message);
+            }
+          } else {
+            Module['setStatus']('');
+          }
+        }
+      },
+  init() {
+        Module['preMainLoop'] && MainLoop.preMainLoop.push(Module['preMainLoop']);
+        Module['postMainLoop'] && MainLoop.postMainLoop.push(Module['postMainLoop']);
+      },
+  runIter(func) {
+        if (ABORT) return;
+        for (var pre of MainLoop.preMainLoop) {
+          if (pre() === false) {
+            return; // |return false| skips a frame
+          }
+        }
+        callUserCallback(func);
+        for (var post of MainLoop.postMainLoop) {
+          post();
+        }
+        checkStackCookie();
+      },
+  nextRAF:0,
+  fakeRequestAnimationFrame(func) {
+        // try to keep 60fps between calls to here
+        var now = Date.now();
+        if (MainLoop.nextRAF === 0) {
+          MainLoop.nextRAF = now + 1000/60;
+        } else {
+          while (now + 2 >= MainLoop.nextRAF) { // fudge a little, to avoid timer jitter causing us to do lots of delay:0
+            MainLoop.nextRAF += 1000/60;
+          }
+        }
+        var delay = Math.max(MainLoop.nextRAF - now, 0);
+        setTimeout(func, delay);
+      },
+  requestAnimationFrame(func) {
+        if (typeof requestAnimationFrame == 'function') {
+          requestAnimationFrame(func);
+          return;
+        }
+        var RAF = MainLoop.fakeRequestAnimationFrame;
+        RAF(func);
+      },
+  };
+  var _emscripten_cancel_main_loop = () => {
+      MainLoop.pause();
+      MainLoop.func = null;
+    };
+
+  var _emscripten_date_now = () => Date.now();
+
+
+  var getHeapMax = () =>
+      HEAPU8.length;
+  
+  
+  var abortOnCannotGrowMemory = (requestedSize) => {
+      abort(`Cannot enlarge memory arrays to size ${requestedSize} bytes (OOM). Either (1) compile with -sINITIAL_MEMORY=X with X higher than the current value ${HEAP8.length}, (2) compile with -sALLOW_MEMORY_GROWTH which allows increasing the size at runtime, or (3) if you want malloc to return NULL (0) instead of this abort, compile with -sABORTING_MALLOC=0`);
+    };
+  var _emscripten_resize_heap = (requestedSize) => {
+      var oldSize = HEAPU8.length;
+      // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
+      requestedSize >>>= 0;
+      abortOnCannotGrowMemory(requestedSize);
+    };
+
+  
   var wasmTableMirror = [];
   
   /** @type {WebAssembly.Table} */
@@ -4342,6 +4509,248 @@ function dbg(...args) {
       var iterFunc = () => getWasmTableEntry(func)(arg);
       setMainLoop(iterFunc, fps, simulateInfiniteLoop, arg);
     };
+
+  var JSEvents = {
+  removeAllEventListeners() {
+        while (JSEvents.eventHandlers.length) {
+          JSEvents._removeHandler(JSEvents.eventHandlers.length - 1);
+        }
+        JSEvents.deferredCalls = [];
+      },
+  inEventHandler:0,
+  deferredCalls:[],
+  deferCall(targetFunction, precedence, argsList) {
+        function arraysHaveEqualContent(arrA, arrB) {
+          if (arrA.length != arrB.length) return false;
+  
+          for (var i in arrA) {
+            if (arrA[i] != arrB[i]) return false;
+          }
+          return true;
+        }
+        // Test if the given call was already queued, and if so, don't add it again.
+        for (var call of JSEvents.deferredCalls) {
+          if (call.targetFunction == targetFunction && arraysHaveEqualContent(call.argsList, argsList)) {
+            return;
+          }
+        }
+        JSEvents.deferredCalls.push({
+          targetFunction,
+          precedence,
+          argsList
+        });
+  
+        JSEvents.deferredCalls.sort((x,y) => x.precedence < y.precedence);
+      },
+  removeDeferredCalls(targetFunction) {
+        JSEvents.deferredCalls = JSEvents.deferredCalls.filter((call) => call.targetFunction != targetFunction);
+      },
+  canPerformEventHandlerRequests() {
+        if (navigator.userActivation) {
+          // Verify against transient activation status from UserActivation API
+          // whether it is possible to perform a request here without needing to defer. See
+          // https://developer.mozilla.org/en-US/docs/Web/Security/User_activation#transient_activation
+          // and https://caniuse.com/mdn-api_useractivation
+          // At the time of writing, Firefox does not support this API: https://bugzilla.mozilla.org/show_bug.cgi?id=1791079
+          return navigator.userActivation.isActive;
+        }
+  
+        return JSEvents.inEventHandler && JSEvents.currentEventHandler.allowsDeferredCalls;
+      },
+  runDeferredCalls() {
+        if (!JSEvents.canPerformEventHandlerRequests()) {
+          return;
+        }
+        var deferredCalls = JSEvents.deferredCalls;
+        JSEvents.deferredCalls = [];
+        for (var call of deferredCalls) {
+          call.targetFunction(...call.argsList);
+        }
+      },
+  eventHandlers:[],
+  removeAllHandlersOnTarget:(target, eventTypeString) => {
+        for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
+          if (JSEvents.eventHandlers[i].target == target &&
+            (!eventTypeString || eventTypeString == JSEvents.eventHandlers[i].eventTypeString)) {
+             JSEvents._removeHandler(i--);
+           }
+        }
+      },
+  _removeHandler(i) {
+        var h = JSEvents.eventHandlers[i];
+        h.target.removeEventListener(h.eventTypeString, h.eventListenerFunc, h.useCapture);
+        JSEvents.eventHandlers.splice(i, 1);
+      },
+  registerOrRemoveHandler(eventHandler) {
+        if (!eventHandler.target) {
+          err('registerOrRemoveHandler: the target element for event handler registration does not exist, when processing the following event handler registration:');
+          console.dir(eventHandler);
+          return -4;
+        }
+        if (eventHandler.callbackfunc) {
+          eventHandler.eventListenerFunc = function(event) {
+            // Increment nesting count for the event handler.
+            ++JSEvents.inEventHandler;
+            JSEvents.currentEventHandler = eventHandler;
+            // Process any old deferred calls the user has placed.
+            JSEvents.runDeferredCalls();
+            // Process the actual event, calls back to user C code handler.
+            eventHandler.handlerFunc(event);
+            // Process any new deferred calls that were placed right now from this event handler.
+            JSEvents.runDeferredCalls();
+            // Out of event handler - restore nesting count.
+            --JSEvents.inEventHandler;
+          };
+  
+          eventHandler.target.addEventListener(eventHandler.eventTypeString,
+                                               eventHandler.eventListenerFunc,
+                                               eventHandler.useCapture);
+          JSEvents.eventHandlers.push(eventHandler);
+        } else {
+          for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
+            if (JSEvents.eventHandlers[i].target == eventHandler.target
+             && JSEvents.eventHandlers[i].eventTypeString == eventHandler.eventTypeString) {
+               JSEvents._removeHandler(i--);
+             }
+          }
+        }
+        return 0;
+      },
+  getNodeNameForTarget(target) {
+        if (!target) return '';
+        if (target == window) return '#window';
+        if (target == screen) return '#screen';
+        return target?.nodeName || '';
+      },
+  fullscreenEnabled() {
+        return document.fullscreenEnabled
+        // Safari 13.0.3 on macOS Catalina 10.15.1 still ships with prefixed webkitFullscreenEnabled.
+        // TODO: If Safari at some point ships with unprefixed version, update the version check above.
+        || document.webkitFullscreenEnabled
+         ;
+      },
+  };
+  
+  
+  /** @type {Object} */
+  var specialHTMLTargets = [0, typeof document != 'undefined' ? document : 0, typeof window != 'undefined' ? window : 0];
+  var getBoundingClientRect = (e) => specialHTMLTargets.indexOf(e) < 0 ? e.getBoundingClientRect() : {'left':0,'top':0};
+  
+  var fillMouseEventData = (eventStruct, e, target) => {
+      assert(eventStruct % 4 == 0);
+      HEAPF64[((eventStruct)>>3)] = e.timeStamp;
+      var idx = ((eventStruct)>>2);
+      HEAP32[idx + 2] = e.screenX;
+      HEAP32[idx + 3] = e.screenY;
+      HEAP32[idx + 4] = e.clientX;
+      HEAP32[idx + 5] = e.clientY;
+      HEAP8[eventStruct + 24] = e.ctrlKey;
+      HEAP8[eventStruct + 25] = e.shiftKey;
+      HEAP8[eventStruct + 26] = e.altKey;
+      HEAP8[eventStruct + 27] = e.metaKey;
+      HEAP16[idx*2 + 14] = e.button;
+      HEAP16[idx*2 + 15] = e.buttons;
+  
+      HEAP32[idx + 8] = e["movementX"]
+        ;
+  
+      HEAP32[idx + 9] = e["movementY"]
+        ;
+  
+      // Note: rect contains doubles (truncated to placate SAFE_HEAP, which is the same behaviour when writing to HEAP32 anyway)
+      var rect = getBoundingClientRect(target);
+      HEAP32[idx + 10] = e.clientX - (rect.left | 0);
+      HEAP32[idx + 11] = e.clientY - (rect.top  | 0);
+  
+    };
+  
+  var maybeCStringToJsString = (cString) => {
+      // "cString > 2" checks if the input is a number, and isn't of the special
+      // values we accept here, EMSCRIPTEN_EVENT_TARGET_* (which map to 0, 1, 2).
+      // In other words, if cString > 2 then it's a pointer to a valid place in
+      // memory, and points to a C string.
+      return cString > 2 ? UTF8ToString(cString) : cString;
+    };
+  
+  var findEventTarget = (target) => {
+      target = maybeCStringToJsString(target);
+      var domElement = specialHTMLTargets[target] || (typeof document != 'undefined' ? document.querySelector(target) : undefined);
+      return domElement;
+    };
+  
+  
+  var registerMouseEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
+      JSEvents.mouseEvent ||= _malloc(64);
+      target = findEventTarget(target);
+  
+      var mouseEventHandlerFunc = (e = event) => {
+        // TODO: Make this access thread safe, or this could update live while app is reading it.
+        fillMouseEventData(JSEvents.mouseEvent, e, target);
+  
+        if (getWasmTableEntry(callbackfunc)(eventTypeId, JSEvents.mouseEvent, userData)) e.preventDefault();
+      };
+  
+      var eventHandler = {
+        target,
+        allowsDeferredCalls: eventTypeString != 'mousemove' && eventTypeString != 'mouseenter' && eventTypeString != 'mouseleave', // Mouse move events do not allow fullscreen/pointer lock requests to be handled in them!
+        eventTypeString,
+        callbackfunc,
+        handlerFunc: mouseEventHandlerFunc,
+        useCapture
+      };
+      return JSEvents.registerOrRemoveHandler(eventHandler);
+    };
+  var _emscripten_set_mousemove_callback_on_thread = (target, userData, useCapture, callbackfunc, targetThread) =>
+      registerMouseEventCallback(target, userData, useCapture, callbackfunc, 8, "mousemove", targetThread);
+
+  
+  
+  
+  var registerUiEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
+      JSEvents.uiEvent ||= _malloc(36);
+  
+      target = findEventTarget(target);
+  
+      var uiEventHandlerFunc = (e = event) => {
+        if (e.target != target) {
+          // Never take ui events such as scroll via a 'bubbled' route, but always from the direct element that
+          // was targeted. Otherwise e.g. if app logs a message in response to a page scroll, the Emscripten log
+          // message box could cause to scroll, generating a new (bubbled) scroll message, causing a new log print,
+          // causing a new scroll, etc..
+          return;
+        }
+        var b = document.body; // Take document.body to a variable, Closure compiler does not outline access to it on its own.
+        if (!b) {
+          // During a page unload 'body' can be null, with "Cannot read property 'clientWidth' of null" being thrown
+          return;
+        }
+        var uiEvent = JSEvents.uiEvent;
+        HEAP32[((uiEvent)>>2)] = 0; // always zero for resize and scroll
+        HEAP32[(((uiEvent)+(4))>>2)] = b.clientWidth;
+        HEAP32[(((uiEvent)+(8))>>2)] = b.clientHeight;
+        HEAP32[(((uiEvent)+(12))>>2)] = innerWidth;
+        HEAP32[(((uiEvent)+(16))>>2)] = innerHeight;
+        HEAP32[(((uiEvent)+(20))>>2)] = outerWidth;
+        HEAP32[(((uiEvent)+(24))>>2)] = outerHeight;
+        HEAP32[(((uiEvent)+(28))>>2)] = pageXOffset | 0; // scroll offsets are float
+        HEAP32[(((uiEvent)+(32))>>2)] = pageYOffset | 0;
+        if (getWasmTableEntry(callbackfunc)(eventTypeId, uiEvent, userData)) e.preventDefault();
+      };
+  
+      var eventHandler = {
+        target,
+        eventTypeString,
+        callbackfunc,
+        handlerFunc: uiEventHandlerFunc,
+        useCapture
+      };
+      return JSEvents.registerOrRemoveHandler(eventHandler);
+    };
+  var _emscripten_set_resize_callback_on_thread = (target, userData, useCapture, callbackfunc, targetThread) =>
+      registerUiEventCallback(target, userData, useCapture, callbackfunc, 10, "resize", targetThread);
+
+  var _emscripten_set_scroll_callback_on_thread = (target, userData, useCapture, callbackfunc, targetThread) =>
+      registerUiEventCallback(target, userData, useCapture, callbackfunc, 11, "scroll", targetThread);
 
   var ENV = {
   };
@@ -4921,8 +5330,6 @@ function dbg(...args) {
   var _wgpuBindGroupRelease = (id) => WebGPU.mgrBindGroup.release(id);
 
   
-  /** @suppress {duplicate } */
-  var setTempRet0 = (val) => __emscripten_tempret_set(val);
   var _setTempRet0 = setTempRet0;
   
   var _wgpuBufferGetSize = function(bufferId) {
@@ -5638,22 +6045,6 @@ function dbg(...args) {
 
   var _wgpuDeviceRelease = (id) => WebGPU.mgrDevice.release(id);
 
-  var maybeCStringToJsString = (cString) => {
-      // "cString > 2" checks if the input is a number, and isn't of the special
-      // values we accept here, EMSCRIPTEN_EVENT_TARGET_* (which map to 0, 1, 2).
-      // In other words, if cString > 2 then it's a pointer to a valid place in
-      // memory, and points to a C string.
-      return cString > 2 ? UTF8ToString(cString) : cString;
-    };
-  
-  /** @type {Object} */
-  var specialHTMLTargets = [0, typeof document != 'undefined' ? document : 0, typeof window != 'undefined' ? window : 0];
-  /** @suppress {duplicate } */
-  var findEventTarget = (target) => {
-      target = maybeCStringToJsString(target);
-      var domElement = specialHTMLTargets[target] || (typeof document != 'undefined' ? document.querySelector(target) : undefined);
-      return domElement;
-    };
   var findCanvasEventTarget = findEventTarget;
   
   
@@ -5966,6 +6357,121 @@ function dbg(...args) {
 
 
 
+
+  var getCFunc = (ident) => {
+      var func = Module['_' + ident]; // closure exported function
+      assert(func, 'Cannot call unknown function ' + ident + ', make sure it is exported');
+      return func;
+    };
+  
+  
+  var writeArrayToMemory = (array, buffer) => {
+      assert(array.length >= 0, 'writeArrayToMemory array must have a length (should be an array or typed array)')
+      HEAP8.set(array, buffer);
+    };
+  
+  
+  
+  
+  
+  
+    /**
+     * @param {string|null=} returnType
+     * @param {Array=} argTypes
+     * @param {Arguments|Array=} args
+     * @param {Object=} opts
+     */
+  var ccall = (ident, returnType, argTypes, args, opts) => {
+      // For fast lookup of conversion functions
+      var toC = {
+        'string': (str) => {
+          var ret = 0;
+          if (str !== null && str !== undefined && str !== 0) { // null string
+            ret = stringToUTF8OnStack(str);
+          }
+          return ret;
+        },
+        'array': (arr) => {
+          var ret = stackAlloc(arr.length);
+          writeArrayToMemory(arr, ret);
+          return ret;
+        }
+      };
+  
+      function convertReturnValue(ret) {
+        if (returnType === 'string') {
+          return UTF8ToString(ret);
+        }
+        if (returnType === 'boolean') return Boolean(ret);
+        return ret;
+      }
+  
+      var func = getCFunc(ident);
+      var cArgs = [];
+      var stack = 0;
+      assert(returnType !== 'array', 'Return type should not be "array".');
+      if (args) {
+        for (var i = 0; i < args.length; i++) {
+          var converter = toC[argTypes[i]];
+          if (converter) {
+            if (stack === 0) stack = stackSave();
+            cArgs[i] = converter(args[i]);
+          } else {
+            cArgs[i] = args[i];
+          }
+        }
+      }
+      var ret = func(...cArgs);
+      function onDone(ret) {
+        if (stack !== 0) stackRestore(stack);
+        return convertReturnValue(ret);
+      }
+  
+      ret = onDone(ret);
+      return ret;
+    };
+  
+    /**
+     * @param {string=} returnType
+     * @param {Array=} argTypes
+     * @param {Object=} opts
+     */
+  var cwrap = (ident, returnType, argTypes, opts) => {
+      return (...args) => ccall(ident, returnType, argTypes, args, opts);
+    };
+
+
+  var incrementExceptionRefcount = (ptr) => ___cxa_increment_exception_refcount(ptr);
+  Module['incrementExceptionRefcount'] = incrementExceptionRefcount;
+
+  var decrementExceptionRefcount = (ptr) => ___cxa_decrement_exception_refcount(ptr);
+  Module['decrementExceptionRefcount'] = decrementExceptionRefcount;
+
+  
+  
+  
+  
+  
+  var getExceptionMessageCommon = (ptr) => {
+      var sp = stackSave();
+      var type_addr_addr = stackAlloc(4);
+      var message_addr_addr = stackAlloc(4);
+      ___get_exception_message(ptr, type_addr_addr, message_addr_addr);
+      var type_addr = HEAPU32[((type_addr_addr)>>2)];
+      var message_addr = HEAPU32[((message_addr_addr)>>2)];
+      var type = UTF8ToString(type_addr);
+      _free(type_addr);
+      var message;
+      if (message_addr) {
+        message = UTF8ToString(message_addr);
+        _free(message_addr);
+      }
+      stackRestore(sp);
+      return [type, message];
+    };
+  var getExceptionMessage = (ptr) => getExceptionMessageCommon(ptr);
+  Module['getExceptionMessage'] = getExceptionMessage;
+
   FS.createPreloadedFile = FS_createPreloadedFile;
   FS.staticInit();
   // Set module methods based on EXPORTED_RUNTIME_METHODS
@@ -5983,7 +6489,21 @@ var wasmImports = {
   /** @export */
   __assert_fail: ___assert_fail,
   /** @export */
+  __cxa_begin_catch: ___cxa_begin_catch,
+  /** @export */
+  __cxa_end_catch: ___cxa_end_catch,
+  /** @export */
+  __cxa_find_matching_catch_2: ___cxa_find_matching_catch_2,
+  /** @export */
+  __cxa_find_matching_catch_3: ___cxa_find_matching_catch_3,
+  /** @export */
+  __cxa_rethrow: ___cxa_rethrow,
+  /** @export */
   __cxa_throw: ___cxa_throw,
+  /** @export */
+  __cxa_uncaught_exceptions: ___cxa_uncaught_exceptions,
+  /** @export */
+  __resumeException: ___resumeException,
   /** @export */
   __syscall_fcntl64: ___syscall_fcntl64,
   /** @export */
@@ -5999,6 +6519,10 @@ var wasmImports = {
   /** @export */
   _tzset_js: __tzset_js,
   /** @export */
+  emscripten_asm_const_int: _emscripten_asm_const_int,
+  /** @export */
+  emscripten_cancel_main_loop: _emscripten_cancel_main_loop,
+  /** @export */
   emscripten_date_now: _emscripten_date_now,
   /** @export */
   emscripten_get_now: _emscripten_get_now,
@@ -6006,6 +6530,12 @@ var wasmImports = {
   emscripten_resize_heap: _emscripten_resize_heap,
   /** @export */
   emscripten_set_main_loop_arg: _emscripten_set_main_loop_arg,
+  /** @export */
+  emscripten_set_mousemove_callback_on_thread: _emscripten_set_mousemove_callback_on_thread,
+  /** @export */
+  emscripten_set_resize_callback_on_thread: _emscripten_set_resize_callback_on_thread,
+  /** @export */
+  emscripten_set_scroll_callback_on_thread: _emscripten_set_scroll_callback_on_thread,
   /** @export */
   environ_get: _environ_get,
   /** @export */
@@ -6018,6 +6548,54 @@ var wasmImports = {
   fd_seek: _fd_seek,
   /** @export */
   fd_write: _fd_write,
+  /** @export */
+  invoke_diii,
+  /** @export */
+  invoke_fiii,
+  /** @export */
+  invoke_i,
+  /** @export */
+  invoke_ii,
+  /** @export */
+  invoke_iii,
+  /** @export */
+  invoke_iiii,
+  /** @export */
+  invoke_iiiii,
+  /** @export */
+  invoke_iiiiid,
+  /** @export */
+  invoke_iiiiii,
+  /** @export */
+  invoke_iiiiiii,
+  /** @export */
+  invoke_iiiiiiii,
+  /** @export */
+  invoke_iiiiiiiiiii,
+  /** @export */
+  invoke_iiiiiiiiiiii,
+  /** @export */
+  invoke_iiiiiiiiiiiii,
+  /** @export */
+  invoke_j,
+  /** @export */
+  invoke_jiiii,
+  /** @export */
+  invoke_v,
+  /** @export */
+  invoke_vi,
+  /** @export */
+  invoke_vii,
+  /** @export */
+  invoke_viii,
+  /** @export */
+  invoke_viiii,
+  /** @export */
+  invoke_viiiiiii,
+  /** @export */
+  invoke_viiiiiiiiii,
+  /** @export */
+  invoke_viiiiiiiiiiiiiii,
   /** @export */
   wgpuAdapterReference: _wgpuAdapterReference,
   /** @export */
@@ -6142,11 +6720,14 @@ var wasmImports = {
 var wasmExports = createWasm();
 var ___wasm_call_ctors = createExportWrapper('__wasm_call_ctors', 0);
 var _main = Module['_main'] = createExportWrapper('main', 2);
+var _on_init = Module['_on_init'] = createExportWrapper('on_init', 3);
+var _on_bounds = Module['_on_bounds'] = createExportWrapper('on_bounds', 5);
 var _fflush = createExportWrapper('fflush', 1);
 var _strerror = createExportWrapper('strerror', 1);
 var _malloc = createExportWrapper('malloc', 1);
 var _free = createExportWrapper('free', 1);
 var _memalign = createExportWrapper('memalign', 2);
+var _setThrew = createExportWrapper('setThrew', 2);
 var __emscripten_tempret_set = createExportWrapper('_emscripten_tempret_set', 1);
 var _emscripten_stack_init = () => (_emscripten_stack_init = wasmExports['emscripten_stack_init'])();
 var _emscripten_stack_get_free = () => (_emscripten_stack_get_free = wasmExports['emscripten_stack_get_free'])();
@@ -6155,16 +6736,290 @@ var _emscripten_stack_get_end = () => (_emscripten_stack_get_end = wasmExports['
 var __emscripten_stack_restore = (a0) => (__emscripten_stack_restore = wasmExports['_emscripten_stack_restore'])(a0);
 var __emscripten_stack_alloc = (a0) => (__emscripten_stack_alloc = wasmExports['_emscripten_stack_alloc'])(a0);
 var _emscripten_stack_get_current = () => (_emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'])();
+var ___cxa_decrement_exception_refcount = createExportWrapper('__cxa_decrement_exception_refcount', 1);
+var ___cxa_increment_exception_refcount = createExportWrapper('__cxa_increment_exception_refcount', 1);
+var ___cxa_free_exception = createExportWrapper('__cxa_free_exception', 1);
+var ___get_exception_message = createExportWrapper('__get_exception_message', 3);
+var ___cxa_can_catch = createExportWrapper('__cxa_can_catch', 3);
+var ___cxa_get_exception_ptr = createExportWrapper('__cxa_get_exception_ptr', 1);
+var dynCall_j = Module['dynCall_j'] = createExportWrapper('dynCall_j', 1);
 var dynCall_jiji = Module['dynCall_jiji'] = createExportWrapper('dynCall_jiji', 5);
 var dynCall_viijii = Module['dynCall_viijii'] = createExportWrapper('dynCall_viijii', 7);
+var dynCall_jiiii = Module['dynCall_jiiii'] = createExportWrapper('dynCall_jiiii', 5);
 var dynCall_iiiiij = Module['dynCall_iiiiij'] = createExportWrapper('dynCall_iiiiij', 7);
 var dynCall_iiiiijj = Module['dynCall_iiiiijj'] = createExportWrapper('dynCall_iiiiijj', 9);
 var dynCall_iiiiiijj = Module['dynCall_iiiiiijj'] = createExportWrapper('dynCall_iiiiiijj', 10);
+
+function invoke_iii(index,a1,a2) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiii(index,a1,a2,a3) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_ii(index,a1) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_vii(index,a1,a2) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1,a2);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_vi(index,a1) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_v(index) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)();
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiiii(index,a1,a2,a3,a4,a5,a6) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiii(index,a1,a2,a3,a4) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1,a2,a3,a4);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiii(index,a1,a2,a3,a4,a5) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiid(index,a1,a2,a3,a4,a5) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viii(index,a1,a2,a3) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1,a2,a3);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiiiii(index,a1,a2,a3,a4,a5,a6,a7) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiiiiiiii(index,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiii(index,a1,a2,a3,a4) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiiiiiiiiii(index,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_fiii(index,a1,a2,a3) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_diii(index,a1,a2,a3) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_i(index) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)();
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiiiiii(index,a1,a2,a3,a4,a5,a6,a7) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiiiiiiiii(index,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiiiiiiiii(index,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiiiiiiiiiiiiii(index,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_j(index) {
+  var sp = stackSave();
+  try {
+    return dynCall_j(index);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_jiiii(index,a1,a2,a3,a4) {
+  var sp = stackSave();
+  try {
+    return dynCall_jiiii(index,a1,a2,a3,a4);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
 
 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
 
+Module['ccall'] = ccall;
+Module['cwrap'] = cwrap;
 var missingLibrarySymbols = [
   'writeI53ToI64',
   'writeI53ToI64Clamped',
@@ -6183,7 +7038,7 @@ var missingLibrarySymbols = [
   'readSockaddr',
   'writeSockaddr',
   'emscriptenLog',
-  'readEmAsmArgs',
+  'runMainThreadEmAsm',
   'jstoi_q',
   'listenOnce',
   'autoResumeAudioContext',
@@ -6199,9 +7054,6 @@ var missingLibrarySymbols = [
   'STACK_ALIGN',
   'POINTER_SIZE',
   'ASSERTIONS',
-  'getCFunc',
-  'ccall',
-  'cwrap',
   'uleb128Encode',
   'sigToWasmTypes',
   'generateFuncType',
@@ -6225,13 +7077,8 @@ var missingLibrarySymbols = [
   'stringToUTF32',
   'lengthBytesUTF32',
   'stringToNewUTF8',
-  'writeArrayToMemory',
   'registerKeyEventCallback',
-  'getBoundingClientRect',
-  'fillMouseEventData',
-  'registerMouseEventCallback',
   'registerWheelEventCallback',
-  'registerUiEventCallback',
   'registerFocusEventCallback',
   'fillDeviceOrientationEventData',
   'registerDeviceOrientationEventCallback',
@@ -6282,7 +7129,6 @@ var missingLibrarySymbols = [
   'makePromise',
   'idsToPromises',
   'makePromiseCallback',
-  'findMatchingCatch',
   'Browser_asyncPrepareDataCounter',
   'safeRequestAnimationFrame',
   'isLeapYear',
@@ -6365,6 +7211,8 @@ var unexportedSymbols = [
   'timers',
   'warnOnce',
   'readEmAsmArgsArray',
+  'readEmAsmArgs',
+  'runEmAsmFunction',
   'jstoi_s',
   'getExecutableName',
   'handleException',
@@ -6376,6 +7224,7 @@ var unexportedSymbols = [
   'mmapAlloc',
   'wasmTable',
   'noExitRuntime',
+  'getCFunc',
   'freeTableIndexes',
   'functionsInTableMap',
   'setValue',
@@ -6392,11 +7241,16 @@ var unexportedSymbols = [
   'stringToAscii',
   'UTF16Decoder',
   'stringToUTF8OnStack',
+  'writeArrayToMemory',
   'JSEvents',
   'specialHTMLTargets',
   'maybeCStringToJsString',
   'findEventTarget',
   'findCanvasEventTarget',
+  'getBoundingClientRect',
+  'fillMouseEventData',
+  'registerMouseEventCallback',
+  'registerUiEventCallback',
   'currentFullscreenStrategy',
   'restoreOldWindowedStyle',
   'UNWIND_CACHE',
@@ -6411,6 +7265,11 @@ var unexportedSymbols = [
   'exceptionLast',
   'exceptionCaught',
   'ExceptionInfo',
+  'findMatchingCatch',
+  'getExceptionMessageCommon',
+  'incrementExceptionRefcount',
+  'decrementExceptionRefcount',
+  'getExceptionMessage',
   'Browser',
   'getPreloadedImageData__data',
   'wget',
