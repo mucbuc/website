@@ -21,6 +21,7 @@
         overflow: hidden;
         position:fixed;
         opacity: 0.5;
+        pointer-events:none;
       }
       .overlay
       {
@@ -36,8 +37,12 @@
     <title>mucbuc</title>
   </head>
   
-  <body> 
-    <canvas class="sdf_canvas" id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+  <body>
+    <a href="./resources/resume.pdf" download="MarkBusenitz.pdf">
+      <i class="fa fa-arrow-circle-down"></i>
+      <span>Download Resume</span>
+    </a>
+    <canvas class="sdf_canvas" id="canvas"></canvas>
     <div class="overlay" id="overlay">
       <h1> Mark Busenitz </h1>
       <h2>Software Engineer</h2>
@@ -47,8 +52,10 @@
         <a class="headerItem">mbusenitz@gmail.com</a>
         <i class="fa fa-phone"></i>
         <a class="headerItem">(341)-400-7592</a>
-        <i class="fa fa-github"></i>
-        <a class="headerItem">www.github.com/mucbuc</a>
+        <a href="https://www.github.com/mucbuc">
+          <i class="fa fa-github"></i>
+          <span>www.github.com/mucbuc</span>
+        </a>
         <i class="fa fa-map-marker"></i>
         <a class="headerItem">San Francisco Bay Area</a>
       </div>
