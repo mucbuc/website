@@ -54,11 +54,19 @@ i
 	margin-left: 40px;
 }
 
+.alert {
+  padding: 20px;
+  background-color: red;
+  color: white;
+  font-size: 20px;
+  text-align: center;
+}
+
 section, fieldset, nav
 {
 	background-color: rgba(.1, .1, .2, 0.25);
 	align-items: center;
-  justify-content: center;
+  text-align: center;
 	padding: 50px;
 	color: white;
 	font-size: 30px;
